@@ -14,6 +14,10 @@ dependencies = [
     "structlog>=24.1.0",
     "python-dateutil>=2.9.0",
     "pyarrow>=24.0.0",
+    "ray[rllib]>=2.55.1",
+    "torch>=2.11.0",
+    "open-spiel>=1.6.14",
+    "pillow>=12.2.0",
 ]
 
 [project.optional-dependencies]
