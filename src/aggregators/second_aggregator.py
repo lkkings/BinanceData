@@ -13,6 +13,12 @@ from ..models.aggregated import UnifiedMarketData
 logger = logging.getLogger(__name__)
 
 
+# 与 history_collector 的 bookDepth 档位口径保持一致：
+# percentage 负值代表 bid 侧偏离 mid 的百分比，正值代表 ask 侧
+DEPTH_PCT_02 = Decimal("0.002")  # ±0.2%
+DEPTH_PCT_1 = Decimal("0.01")    # ±1%
+
+
 class SecondAggregator:
     """秒级数据聚合器
 
@@ -34,6 +40,8 @@ class SecondAggregator:
         # 数据缓冲区（按秒分组）
         self.orderbook_buffer = defaultdict(list)  # {timestamp_second: [updates]}
         self.trade_buffer = defaultdict(list)      # {timestamp_second: [trades]}
+        # K线流：每 symbol 仅保留最新快照（含进行中的当前分钟），按秒 ffill 用
+        self.last_kline: dict[str, dict] = {}
 
         # 当前订单簿状态（用于计算深度）
         self.current_orderbook = {}  # {symbol: {'bids': {}, 'asks': {}}}
@@ -106,6 +114,25 @@ class SecondAggregator:
         # 更新事件时间水位线
         if timestamp_second > self.max_event_second:
             self.max_event_second = timestamp_second
+
+    def add_kline(self, symbol: str, data: dict):
+        """添加 K 线快照（kline_<interval> 流）
+
+        K 线流每 1~2 秒推送一次进行中（未关闭）的当前 K 线，K 线关闭时再推一次。
+        我们按 symbol 仅保留最新快照，由聚合循环按秒 ffill 到 UnifiedMarketData。
+
+        Args:
+            symbol: 交易对
+            data: 由 BinanceCollector.parse_kline 解析后的 dict
+        """
+        self.last_kline[symbol] = data
+
+        # 将 event_time 也纳入水位线，避免在仅有 kline 流时阻塞输出
+        timestamp_ms = data.get('event_time') or data.get('close_time')
+        if timestamp_ms:
+            timestamp_second = self._get_second_timestamp(timestamp_ms)
+            if timestamp_second > self.max_event_second:
+                self.max_event_second = timestamp_second
 
     def _get_second_timestamp(self, timestamp_ms: int) -> int:
         """将毫秒时间戳转换为秒级时间戳"""
@@ -188,6 +215,7 @@ class SecondAggregator:
                     self._compute_trade_features(tr_list)
                     if tr_list else None
                 )
+                kline_feat = self._compute_kline_features(self.last_kline.get(symbol))
 
                 # 零成交秒：OHLC 用上一秒 close 填充，量类为 0
                 if tr_feat is None:
@@ -226,6 +254,7 @@ class SecondAggregator:
                     volume_imbalance=tr_feat['volume_imbalance'],
                     large_trade_count=tr_feat['large_trade_count'],
                     large_trade_volume=tr_feat['large_trade_volume'],
+                    # 实时 depth@100ms 衍生（top-of-book + 5 档）
                     best_bid_price=ob_feat['best_bid_price'] if ob_feat else None,
                     best_bid_qty=ob_feat['best_bid_qty'] if ob_feat else None,
                     best_ask_price=ob_feat['best_ask_price'] if ob_feat else None,
@@ -234,6 +263,32 @@ class SecondAggregator:
                     mid_price=ob_feat['mid_price'] if ob_feat else None,
                     imbalance_5=ob_feat['imbalance_5'] if ob_feat else None,
                     update_count=ob_feat['update_count'] if ob_feat else 0,
+                    # 订单簿深度（与 history bookDepth 字段口径对齐）
+                    bid_depth_02=ob_feat['bid_depth_02'] if ob_feat else None,
+                    ask_depth_02=ob_feat['ask_depth_02'] if ob_feat else None,
+                    bid_notional_02=ob_feat['bid_notional_02'] if ob_feat else None,
+                    ask_notional_02=ob_feat['ask_notional_02'] if ob_feat else None,
+                    depth_imbalance_02=ob_feat['depth_imbalance_02'] if ob_feat else None,
+                    bid_depth_1=ob_feat['bid_depth_1'] if ob_feat else None,
+                    ask_depth_1=ob_feat['ask_depth_1'] if ob_feat else None,
+                    depth_imbalance_1=ob_feat['depth_imbalance_1'] if ob_feat else None,
+                    total_bid_depth=ob_feat['total_bid_depth'] if ob_feat else None,
+                    total_ask_depth=ob_feat['total_ask_depth'] if ob_feat else None,
+                    depth_imbalance_total=ob_feat['depth_imbalance_total'] if ob_feat else None,
+                    # K 线特征（来自 kline_<interval> 流，按秒 ffill）
+                    kline_open=kline_feat['kline_open'] if kline_feat else None,
+                    kline_high=kline_feat['kline_high'] if kline_feat else None,
+                    kline_low=kline_feat['kline_low'] if kline_feat else None,
+                    kline_close=kline_feat['kline_close'] if kline_feat else None,
+                    kline_volume=kline_feat['kline_volume'] if kline_feat else None,
+                    kline_quote_volume=kline_feat['kline_quote_volume'] if kline_feat else None,
+                    kline_count=kline_feat['kline_count'] if kline_feat else None,
+                    kline_taker_buy_volume=kline_feat['kline_taker_buy_volume'] if kline_feat else None,
+                    kline_taker_buy_quote_volume=kline_feat['kline_taker_buy_quote_volume'] if kline_feat else None,
+                    kline_taker_buy_ratio=kline_feat['kline_taker_buy_ratio'] if kline_feat else None,
+                    kline_body_ratio=kline_feat['kline_body_ratio'] if kline_feat else None,
+                    kline_upper_shadow=kline_feat['kline_upper_shadow'] if kline_feat else None,
+                    kline_lower_shadow=kline_feat['kline_lower_shadow'] if kline_feat else None,
                 )
 
                 if self.on_aggregated_data:
@@ -286,11 +341,45 @@ class SecondAggregator:
         bid_depth_5 = sum((qty for _, qty in top_5_bids), Decimal('0'))
         ask_depth_5 = sum((qty for _, qty in top_5_asks), Decimal('0'))
 
-        total_depth = bid_depth_5 + ask_depth_5
+        total_depth_5 = bid_depth_5 + ask_depth_5
         imbalance_5 = (
-            float((bid_depth_5 - ask_depth_5) / total_depth)
-            if total_depth > 0 else 0.0
+            float((bid_depth_5 - ask_depth_5) / total_depth_5)
+            if total_depth_5 > 0 else 0.0
         )
+
+        # 与 history bookDepth 对齐：±0.2% / ±1% / 全簿 累计深度与名义额
+        bid_thr_02 = mid_price * (Decimal('1') - DEPTH_PCT_02)
+        ask_thr_02 = mid_price * (Decimal('1') + DEPTH_PCT_02)
+        bid_thr_1 = mid_price * (Decimal('1') - DEPTH_PCT_1)
+        ask_thr_1 = mid_price * (Decimal('1') + DEPTH_PCT_1)
+
+        bid_depth_02 = Decimal('0')
+        bid_notional_02 = Decimal('0')
+        bid_depth_1 = Decimal('0')
+        total_bid_depth = Decimal('0')
+        for price, qty in sorted_bids:
+            total_bid_depth += qty
+            if price >= bid_thr_02:
+                bid_depth_02 += qty
+                bid_notional_02 += price * qty
+            if price >= bid_thr_1:
+                bid_depth_1 += qty
+
+        ask_depth_02 = Decimal('0')
+        ask_notional_02 = Decimal('0')
+        ask_depth_1 = Decimal('0')
+        total_ask_depth = Decimal('0')
+        for price, qty in sorted_asks:
+            total_ask_depth += qty
+            if price <= ask_thr_02:
+                ask_depth_02 += qty
+                ask_notional_02 += price * qty
+            if price <= ask_thr_1:
+                ask_depth_1 += qty
+
+        def _imbalance(bid: Decimal, ask: Decimal) -> float:
+            total = bid + ask
+            return float((bid - ask) / total) if total > 0 else 0.0
 
         return {
             'best_bid_price': best_bid_price,
@@ -301,6 +390,65 @@ class SecondAggregator:
             'mid_price': mid_price,
             'imbalance_5': imbalance_5,
             'update_count': len(updates),
+            'bid_depth_02': float(bid_depth_02),
+            'ask_depth_02': float(ask_depth_02),
+            'bid_notional_02': float(bid_notional_02),
+            'ask_notional_02': float(ask_notional_02),
+            'depth_imbalance_02': _imbalance(bid_depth_02, ask_depth_02),
+            'bid_depth_1': float(bid_depth_1),
+            'ask_depth_1': float(ask_depth_1),
+            'depth_imbalance_1': _imbalance(bid_depth_1, ask_depth_1),
+            'total_bid_depth': float(total_bid_depth),
+            'total_ask_depth': float(total_ask_depth),
+            'depth_imbalance_total': _imbalance(total_bid_depth, total_ask_depth),
+        }
+
+    @staticmethod
+    def _compute_kline_features(kline: Optional[dict]) -> Optional[dict]:
+        """从最新 K 线快照计算 UnifiedMarketData 中的 kline_* 特征。
+
+        与 history_collector._compute_kline_features 保持口径一致：
+          - kline_taker_buy_ratio: taker_buy_volume / volume（volume==0 → 0.5）
+          - kline_body_ratio:      |close-open| / (high-low)（区间为 0 → 0）
+          - kline_upper_shadow:    (high - max(open,close)) / (high-low)
+          - kline_lower_shadow:    (min(open,close) - low) / (high-low)
+        """
+        if kline is None:
+            return None
+
+        open_p = kline['open']
+        high_p = kline['high']
+        low_p = kline['low']
+        close_p = kline['close']
+        volume = kline['volume']
+        taker_buy_volume = kline['taker_buy_volume']
+
+        hl_range = high_p - low_p
+        body = abs(close_p - open_p)
+        upper_shadow = high_p - max(open_p, close_p)
+        lower_shadow = min(open_p, close_p) - low_p
+
+        taker_buy_ratio = (
+            float(taker_buy_volume / volume) if volume > 0 else 0.5
+        )
+        body_ratio = float(body / hl_range) if hl_range > 0 else 0.0
+        upper_ratio = float(upper_shadow / hl_range) if hl_range > 0 else 0.0
+        lower_ratio = float(lower_shadow / hl_range) if hl_range > 0 else 0.0
+
+        return {
+            'kline_open': float(open_p),
+            'kline_high': float(high_p),
+            'kline_low': float(low_p),
+            'kline_close': float(close_p),
+            'kline_volume': float(volume),
+            'kline_quote_volume': float(kline['quote_volume']),
+            'kline_count': int(kline['count']),
+            'kline_taker_buy_volume': float(taker_buy_volume),
+            'kline_taker_buy_quote_volume': float(kline['taker_buy_quote_volume']),
+            'kline_taker_buy_ratio': taker_buy_ratio,
+            'kline_body_ratio': body_ratio,
+            'kline_upper_shadow': upper_ratio,
+            'kline_lower_shadow': lower_ratio,
         }
 
     def _compute_trade_features(self, trades: list[dict]) -> Optional[dict]:

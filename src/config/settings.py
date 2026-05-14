@@ -6,14 +6,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """应用配置"""
-
+    mode: str = "realtime"
     # Binance API 配置（可选，用于私有数据）
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
 
     # 交易对和数据流配置
     symbols: list[str] = ["btcusdt"]
-    streams: list[str] = ["depth@100ms", "trade"]
+    streams: list[str] = ["depth@100ms", "trade", "kline_1m"]
 
     # 数据存储配置
     data_dir: Path = Path("./data")

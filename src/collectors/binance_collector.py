@@ -239,3 +239,68 @@ class BinanceCollector:
             'best_ask_price': Decimal(data['a']),
             'best_ask_qty': Decimal(data['A'])
         }
+
+    @staticmethod
+    def parse_kline(data: dict) -> dict:
+        """解析 K 线数据（kline_<interval>）
+
+        根据 Binance 官方文档，kline 流的消息格式为：
+        {
+            "e": "kline",
+            "E": 1778573295883,
+            "s": "BTCUSDT",
+            "k": {
+                "t": 1778573280000,
+                "T": 1778573339999,
+                "s": "BTCUSDT",
+                "i": "1m",
+                "o": "80892.03000000",
+                "c": "80892.04000000",
+                "h": "80900.00000000",
+                "l": "80800.00000000",
+                "v": "10.5",
+                "n": 35,
+                "x": false,
+                "q": "850000.00",
+                "V": "5.2",
+                "Q": "420000.00"
+            }
+        }
+
+        Returns:
+            {
+                'event_time': int,
+                'symbol': str,
+                'open_time': int,
+                'close_time': int,
+                'interval': str,
+                'open': Decimal,
+                'high': Decimal,
+                'low': Decimal,
+                'close': Decimal,
+                'volume': Decimal,
+                'quote_volume': Decimal,
+                'count': int,
+                'taker_buy_volume': Decimal,
+                'taker_buy_quote_volume': Decimal,
+                'is_closed': bool
+            }
+        """
+        k = data['k']
+        return {
+            'event_time': data['E'],
+            'symbol': data['s'],
+            'open_time': k['t'],
+            'close_time': k['T'],
+            'interval': k['i'],
+            'open': Decimal(k['o']),
+            'high': Decimal(k['h']),
+            'low': Decimal(k['l']),
+            'close': Decimal(k['c']),
+            'volume': Decimal(k['v']),
+            'quote_volume': Decimal(k['q']),
+            'count': int(k['n']),
+            'taker_buy_volume': Decimal(k['V']),
+            'taker_buy_quote_volume': Decimal(k['Q']),
+            'is_closed': bool(k['x']),
+        }

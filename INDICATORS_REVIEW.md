@@ -13,7 +13,6 @@
 | 时间戳严格连续（86399 条 + 补齐 4233 秒） | ✅ |
 | OHLC / VWAP / volume 拆分等恒等关系 | ✅ |
 | `trade_flow_toxicity` 字段已下线 | ✅ |
-| 新增 `depth_age_seconds`（快照陈旧度）| ✅ 中位 0s / p99 ≈ 30s / max 280s |
 | 大单检测真实命中（此前被全局 p99.9 过滤砍掉） | ✅ 46% 秒有大单，max_trade_size p99 = 2.7 BTC |
 | 聚合性能（270 万 trades + 32k 深度快照 / 天） | ✅ 16.8s（旧 groupby+iterrows 约慢数十倍）|
 

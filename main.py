@@ -92,9 +92,6 @@ def save_aggregated_data(records: list[UnifiedMarketData], symbol: str, date_str
         for col in depth_cols:
             df[col] = df[col].ffill()
 
-    if depth_age is not None:
-        df['depth_age_seconds'] = depth_age
-
     # 流量 / 计数 / 不平衡度：无成交秒自然为 0
     zero_fill_cols = [
         'volume', 'quote_volume',
@@ -139,6 +136,9 @@ class RealtimeSystem:
             elif stream_type == 'trade':
                 parsed = BinanceCollector.parse_trade(data)
                 self.aggregator.add_trade(parsed['symbol'], parsed)
+            elif stream_type.startswith('kline'):
+                parsed = BinanceCollector.parse_kline(data)
+                self.aggregator.add_kline(parsed['symbol'], parsed)
         except Exception as e:
             logger.error(f"消息处理错误: {e}", exc_info=True)
 
@@ -197,40 +197,38 @@ class RealtimeSystem:
 async def main():
     settings = get_settings()
     symbol = settings.symbols[0].upper()
-    from datetime import date
+    if settings.mode != "realtime":
+        from datetime import date
+        start_date = date(2026, 5, 10)
+        end_date   = date(2026, 5, 13)
+        logger.info("=" * 60)
+        logger.info(f"Binance 数据采集: {symbol}")
+        logger.info(f"日期范围: {start_date} ~ {end_date}")
+        logger.info("历史数据采集")
+        logger.info("=" * 60)
+        history = HistoryCollector(symbol)
+        all_records: list[UnifiedMarketData] = []
 
-    start_date = date(2026, 5, 12)
-    end_date   = date(2026, 5, 13)
+        current = start_date
+        while current <= end_date:
+            date_str = current.strftime("%Y-%m-%d")
+            records = history.collect_day(date_str)
 
-    logger.info("=" * 60)
-    logger.info(f"Binance 数据采集: {symbol}")
-    logger.info(f"日期范围: {start_date} ~ {end_date}")
-    logger.info("优先历史数据，不可用时回退 WebSocket")
-    logger.info("=" * 60)
+            if records is not None:
+                all_records.extend(records)
+            else:
+                logger.error(f"{date_str} 历史数据不可用")
 
-    history = HistoryCollector(symbol)
-    all_records: list[UnifiedMarketData] = []
-    realtime_dates = []
+            current += timedelta(days=1)
 
-    current = start_date
-    while current <= end_date:
-        date_str = current.strftime("%Y-%m-%d")
-        records = history.collect_day(date_str)
-
-        if records is not None:
-            all_records.extend(records)
-        else:
-            logger.info(f"{date_str} 历史数据不可用，标记为实时采集")
-            realtime_dates.append(date_str)
-
-        current += timedelta(days=1)
-
-    # 保存整个时间段为一个数据集
-    if all_records:
-        save_aggregated_data(all_records, symbol, f"{start_date}_{end_date}")
-
-    if realtime_dates:
-        logger.info(f"启动实时采集（覆盖日期: {realtime_dates}）")
+        # 保存整个时间段为一个数据集
+        if all_records:
+            save_aggregated_data(all_records, symbol, f"{start_date}_{end_date}")
+    else:
+        logger.info("=" * 60)
+        logger.info(f"Binance 数据采集: {symbol}")
+        logger.info(f"启动实时采集")
+        logger.info("=" * 60)
         system = RealtimeSystem(symbol)
         try:
             await system.start()
@@ -238,8 +236,8 @@ async def main():
             logger.error(f"实时采集错误: {e}", exc_info=True)
         finally:
             await system.stop()
-    else:
-        logger.info("所有日期均已通过历史数据完成采集")
+    # else:
+    #     logger.info("所有日期均已通过历史数据完成采集")
 
 
 if __name__ == '__main__':

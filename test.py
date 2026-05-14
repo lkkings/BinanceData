@@ -1,35 +1,36 @@
 """
 PPO-Based Market Maker Online Reinforcement Learning System
-基于PPO的做市商在线强化学习系统
+基于PPO的做市商在线强化学习系统 (Ray RLlib 2.55+)
 
 Features:
-- PPO algorithm with Ray RLlib 2.x
-- Expert data/demonstration support
+- PPO algorithm with Ray RLlib 2.55 (new API stack)
+- Expert data/demonstration support via BC auxiliary loss
 - Evaluation after each training round
 - Checkpoint save/restore for continued training
-- Integration with Binance data collection
+- Uses BTCUSDT_2026-05-10_2026-05-13.csv (1-second aggregated data)
 
-Usage:
+Usage (uv):
+    # Generate expert data from strategy signal
+    uv run python test.py --mode gen_expert
+
     # Train from scratch
-    python test.py --mode train --iterations 100
+    uv run python test.py --mode train --iterations 30
+
+    # Train with expert data (BC warmup + PPO with BC auxiliary loss)
+    uv run python test.py --mode train_expert --iterations 30
 
     # Continue training from checkpoint
-    python test.py --mode continue --checkpoint ./checkpoints/latest
-
-    # Train with expert data
-    python test.py --mode train_expert --expert_data ./expert_data.json
+    uv run python test.py --mode continue --checkpoint ./checkpoints/latest
 
     # Evaluate only
-    python test.py --mode evaluate --checkpoint ./checkpoints/best
+    uv run python test.py --mode evaluate --checkpoint ./checkpoints/best
 """
 
-import os
-import sys
 import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -38,255 +39,286 @@ import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 
-# Ray RLlib imports
 import ray
-from ray.rllib.algorithms.ppo import PPO, PPOConfig
-from ray.rllib.algorithms.callbacks import DefaultCallbacks
-from ray.rllib.env import BaseEnv
-from ray.rllib.evaluation import Episode, RolloutWorker
-from ray.rllib.policy import Policy
+from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.callbacks.callbacks import RLlibCallback
+from ray.tune.registry import register_env
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# Constants
+# ============================================================================
+
+DATA_CSV = "data/aggregated/BTCUSDT_2026-05-10_2026-05-13.csv"
+EXPERT_DATA_DIR = "./expert_data"
+CHECKPOINT_DIR = "./checkpoints"
+
+MAKER_FEE_BPS = 2.0
+TAKER_FEE_BPS = 5.0
+
+# Feature columns derived from the CSV
+FEATURE_COLS = [
+    "log_return",
+    "price_range_rel",
+    "volume_log",
+    "trade_intensity_log",
+    "volume_imbalance",
+    "depth_imbalance_02",
+    "depth_imbalance_1",
+    "depth_imbalance_total",
+    "taker_buy_skew",
+    "kline_body_ratio",
+    "kline_upper_shadow",
+    "kline_lower_shadow",
+]
+N_FEATURES = len(FEATURE_COLS)
+N_POS_STATE = 3  # inventory_sign, unrealized_pnl_norm, hold_time_norm
+OBS_DIM = N_FEATURES + N_POS_STATE
+
+# Discrete actions
+ACTION_HOLD = 0
+ACTION_OPEN_LONG = 1
+ACTION_OPEN_SHORT = 2
+ACTION_CLOSE = 3
+N_ACTIONS = 4
+
 
 # ============================================================================
-# Part 1: Market Maker Environment
+# Part 1: Data Loading & Feature Engineering
 # ============================================================================
 
-@dataclass
-class MarketState:
-    """Current market state snapshot"""
-    mid_price: float
-    spread_bps: float
-    bid_depth_5: float
-    ask_depth_5: float
-    imbalance_5: float
-    vwap: float
-    volume: float
-    buy_sell_ratio: float
-    volatility: float
-    inventory: float
+def load_and_prepare(csv_path: str) -> pd.DataFrame:
+    """Load CSV and compute derived features for the environment."""
+    df = pd.read_csv(csv_path)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
 
+    df["close"] = df["close"].ffill().bfill()
+    df["log_return"] = np.log(df["close"]).diff().fillna(0.0)
+    df["price_range_rel"] = ((df["high"] - df["low"]) / df["close"].replace(0, np.nan)).fillna(0.0)
+    df["volume_log"] = np.log1p(df["volume"].fillna(0.0))
+    df["trade_intensity_log"] = np.log1p(df["trade_intensity"].fillna(0.0))
+
+    for col in ("depth_imbalance_02", "depth_imbalance_1", "depth_imbalance_total"):
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = df[col].fillna(0.0)
+
+    if "kline_taker_buy_ratio" in df.columns:
+        df["taker_buy_skew"] = df["kline_taker_buy_ratio"].fillna(0.5) - 0.5
+    else:
+        df["taker_buy_skew"] = 0.0
+
+    for col in ("volume_imbalance", "kline_body_ratio", "kline_upper_shadow", "kline_lower_shadow"):
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = df[col].fillna(0.0)
+
+    for col in FEATURE_COLS:
+        s = df[col].astype(np.float32)
+        mu, sd = s.mean(), s.std()
+        df[col] = ((s - mu) / (sd + 1e-8)).clip(-5.0, 5.0)
+
+    logger.info(f"Loaded {len(df)} rows from {csv_path}")
+    return df
+
+
+# ============================================================================
+# Part 2: Market Maker Environment (Gymnasium)
+# ============================================================================
 
 class MarketMakerEnv(gym.Env):
-    """Market Maker Environment for PPO Training"""
+    """Discrete-action market maker environment for PPO training.
 
-    def __init__(self, config: Dict[str, Any]):
+    Actions: 0=hold, 1=open_long, 2=open_short, 3=close
+    Observation: 12 market features + 3 position state = 15 dims
+    """
+
+    def __init__(self, config: Dict[str, Any] = None):
         super().__init__()
-        self.max_inventory = config.get("max_inventory", 10.0)
-        self.inventory_penalty = config.get("inventory_penalty", 0.01)
-        self.spread_reward_weight = config.get("spread_reward_weight", 1.0)
-        self.fill_reward = config.get("fill_reward", 0.1)
-        self.tick_size = config.get("tick_size", 0.01)
-        self.data_path = self._validate_path(config.get("data_path", "./data/aggregated"))
+        config = config or {}
+        csv_path = config.get("data_path", DATA_CSV)
+        self.episode_length = config.get("episode_length", 1024)
+        self.max_hold_seconds = config.get("max_hold_seconds", 30)
+        self.sl_bps = config.get("sl_bps", 8.0)
+        self.tp_bps = config.get("tp_bps", 12.0)
+        self.inventory_penalty = config.get("inventory_penalty", 0.0001)
+        self.pnl_scale = config.get("pnl_scale", 0.01)
 
-        self.data_df: Optional[pd.DataFrame] = None
-        self.current_step = 0
-        self.max_steps = config.get("max_steps", 1000)
-        self.inventory = 0.0
-        self.cash = 0.0
-        self.total_pnl = 0.0
-
-        self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(2,), dtype=np.float32
-        )
+        self.action_space = spaces.Discrete(N_ACTIONS)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
         )
 
-        self._load_data()
+        self.df = load_and_prepare(csv_path)
+        self._features = self.df[FEATURE_COLS].values.astype(np.float32)
+        self._closes = self.df["close"].values.astype(np.float64)
+        self._highs = self.df["high"].fillna(self.df["close"]).values.astype(np.float64)
+        self._lows = self.df["low"].fillna(self.df["close"]).values.astype(np.float64)
+        self.n = len(self.df)
 
-    def _validate_path(self, path: str) -> str:
-        """Validate and normalize path to prevent traversal attacks"""
-        normalized = Path(path).resolve()
-        base_dir = Path.cwd().resolve()
-        if not str(normalized).startswith(str(base_dir)):
-            raise ValueError(f"Path {path} is outside allowed directory")
-        return str(normalized)
+        self.rng = np.random.default_rng(config.get("seed", None))
+        self._reset_state()
 
-    def _load_data(self):
-        """Load aggregated market data"""
-        data_path = Path(self.data_path)
-        if not data_path.exists():
-            raise FileNotFoundError(f"Data path {data_path} does not exist")
+    def _reset_state(self):
+        self.t = 0
+        self.end = 0
+        self.position = 0
+        self.entry_px = 0.0
+        self.entry_t = 0
+        self.realized_pnl_bps = 0.0
 
-        csv_files = list(data_path.glob("*.csv"))
-        if not csv_files:
-            raise FileNotFoundError(f"No CSV files found in {data_path}")
-
-        self.data_df = pd.read_csv(csv_files[0])
-        self.data_df["timestamp"] = pd.to_datetime(self.data_df["timestamp"])
-        self.max_steps = min(len(self.data_df) - 1, self.max_steps)
-        logger.info(f"Loaded {len(self.data_df)} rows from {csv_files[0]}")
-
-    def reset(
-        self, *, seed: Optional[int] = None, options: Optional[Dict] = None
-    ) -> Tuple[np.ndarray, Dict]:
-        """Reset environment to initial state"""
+    def reset(self, *, seed=None, options=None) -> Tuple[np.ndarray, Dict]:
         super().reset(seed=seed)
-        self.current_step = 0
-        self.inventory = 0.0
-        self.cash = 0.0
-        self.total_pnl = 0.0
-        return self._get_observation(), self._get_info()
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        high = max(1, self.n - self.episode_length - 1)
+        self.t = int(self.rng.integers(0, high))
+        self.end = min(self.t + self.episode_length, self.n - 1)
+        self.position = 0
+        self.entry_px = 0.0
+        self.entry_t = 0
+        self.realized_pnl_bps = 0.0
+        return self._obs(), self._info()
 
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """Execute one step in the environment"""
-        if self.data_df is None or self.current_step >= len(self.data_df):
-            return self._get_observation(), 0.0, True, False, self._get_info()
-
-        bid_offset_frac, ask_offset_frac = action
-        row = self.data_df.iloc[self.current_step]
-        mid_price = float(row["mid_price"])
-        spread = float(row.get("spread_bps", 10.0)) * mid_price / 10000.0
-
-        bid_offset = bid_offset_frac * spread * 0.5
-        ask_offset = ask_offset_frac * spread * 0.5
-        our_bid = mid_price - spread / 2 + bid_offset
-        our_ask = mid_price + spread / 2 + ask_offset
-
-        bid_fill_prob = self._calculate_fill_probability(our_bid, mid_price - spread / 2, True)
-        ask_fill_prob = self._calculate_fill_probability(our_ask, mid_price + spread / 2, False)
-
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+        px = float(self._closes[self.t])
+        nxt = min(self.t + 1, self.n - 1)
+        nxt_px = float(self._closes[nxt])
+        nxt_high = float(self._highs[nxt])
+        nxt_low = float(self._lows[nxt])
         reward = 0.0
-        if np.random.random() < bid_fill_prob and self.inventory < self.max_inventory:
-            self.inventory += 1.0
-            self.cash -= our_bid
-            reward += self.fill_reward
 
-        if np.random.random() < ask_fill_prob and self.inventory > -self.max_inventory:
-            self.inventory -= 1.0
-            self.cash += our_ask
-            reward += self.fill_reward
+        if self.position == 0:
+            if action == ACTION_OPEN_LONG:
+                self.position = 1
+                self.entry_px = px
+                self.entry_t = self.t
+            elif action == ACTION_OPEN_SHORT:
+                self.position = -1
+                self.entry_px = px
+                self.entry_t = self.t
+        else:
+            held = self.t - self.entry_t
+            forced_close = False
+            close_is_taker = False
+            close_px = nxt_px
 
-        unrealized_pnl = self.inventory * mid_price
-        self.total_pnl = self.cash + unrealized_pnl
-        spread_reward = (our_ask - our_bid) * self.spread_reward_weight
-        inventory_penalty = -abs(self.inventory) * self.inventory_penalty
-        reward += spread_reward + inventory_penalty
+            if self.position == 1:
+                sl_px = self.entry_px * (1 - self.sl_bps / 10000)
+                tp_px = self.entry_px * (1 + self.tp_bps / 10000)
+                if nxt_low <= sl_px:
+                    forced_close, close_is_taker, close_px = True, True, sl_px
+                elif nxt_high >= tp_px:
+                    forced_close, close_is_taker, close_px = True, False, tp_px
+            else:
+                sl_px = self.entry_px * (1 + self.sl_bps / 10000)
+                tp_px = self.entry_px * (1 - self.tp_bps / 10000)
+                if nxt_high >= sl_px:
+                    forced_close, close_is_taker, close_px = True, True, sl_px
+                elif nxt_low <= tp_px:
+                    forced_close, close_is_taker, close_px = True, False, tp_px
 
-        self.current_step += 1
-        terminated = self.current_step >= self.max_steps
-        truncated = abs(self.inventory) > self.max_inventory * 1.5
+            if not forced_close and held >= self.max_hold_seconds:
+                forced_close, close_is_taker, close_px = True, True, nxt_px
 
-        return self._get_observation(), reward, terminated, truncated, self._get_info()
+            do_close = forced_close or action == ACTION_CLOSE
+            if do_close:
+                if self.position == 1:
+                    gross_bps = (close_px - self.entry_px) / self.entry_px * 10000
+                else:
+                    gross_bps = (self.entry_px - close_px) / self.entry_px * 10000
+                exit_fee = TAKER_FEE_BPS if close_is_taker else MAKER_FEE_BPS
+                net_bps = gross_bps - MAKER_FEE_BPS - exit_fee
+                reward += net_bps * self.pnl_scale
+                self.realized_pnl_bps += net_bps
+                self.position = 0
+                self.entry_px = 0.0
+                self.entry_t = 0
+            else:
+                if self.position == 1:
+                    mtm = (nxt_px - px) / max(self.entry_px, 1e-9) * 10000
+                else:
+                    mtm = (px - nxt_px) / max(self.entry_px, 1e-9) * 10000
+                reward += mtm * self.pnl_scale
+                reward -= self.inventory_penalty
 
-    def _get_observation(self) -> np.ndarray:
-        """Get current observation"""
-        if self.data_df is None or self.current_step >= len(self.data_df):
-            return np.zeros(11, dtype=np.float32)
+        self.t = nxt
+        terminated = self.t >= self.end
+        truncated = False
 
-        row = self.data_df.iloc[self.current_step]
-        obs = np.array([
-            float(row.get("mid_price", 0)) / 100000.0,
-            float(row.get("spread_bps", 0)) / 100.0,
-            float(row.get("bid_depth_5", 0)) / 1000.0,
-            float(row.get("ask_depth_5", 0)) / 1000.0,
-            float(row.get("imbalance_5", 0)),
-            float(row.get("vwap", 0)) / 100000.0,
-            float(row.get("volume", 0)) / 100.0,
-            float(row.get("buy_sell_ratio", 1.0)),
-            float(row.get("volatility", 0)) * 100.0,
-            self.inventory / self.max_inventory,
-            self.total_pnl / 10000.0,
-        ], dtype=np.float32)
-        return obs
+        if terminated and self.position != 0:
+            close_px = nxt_px
+            if self.position == 1:
+                gross_bps = (close_px - self.entry_px) / self.entry_px * 10000
+            else:
+                gross_bps = (self.entry_px - close_px) / self.entry_px * 10000
+            net_bps = gross_bps - MAKER_FEE_BPS - TAKER_FEE_BPS
+            reward += net_bps * self.pnl_scale
+            self.realized_pnl_bps += net_bps
+            self.position = 0
 
-    def _get_info(self) -> Dict:
-        """Get additional info"""
+        return self._obs(), float(reward), terminated, truncated, self._info()
+
+    def _obs(self) -> np.ndarray:
+        feats = self._features[self.t]
+        if self.position == 0:
+            pos_state = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            px = float(self._closes[self.t])
+            if self.position == 1:
+                unr = (px - self.entry_px) / max(self.entry_px, 1e-9) * 10000
+            else:
+                unr = (self.entry_px - px) / max(self.entry_px, 1e-9) * 10000
+            hold_norm = (self.t - self.entry_t) / max(self.max_hold_seconds, 1)
+            pos_state = np.array([float(self.position), unr / 100.0, hold_norm], dtype=np.float32)
+        return np.concatenate([feats, pos_state])
+
+    def _info(self) -> Dict:
         return {
-            "inventory": self.inventory,
-            "cash": self.cash,
-            "total_pnl": self.total_pnl,
-            "step": self.current_step,
+            "position": self.position,
+            "realized_pnl_bps": self.realized_pnl_bps,
+            "step": self.t,
         }
 
-    def _calculate_fill_probability(
-        self, our_price: float, market_price: float, is_bid: bool
-    ) -> float:
-        """Calculate probability of order being filled"""
-        if is_bid:
-            price_diff = our_price - market_price
-        else:
-            price_diff = market_price - our_price
-        prob = 1.0 / (1.0 + np.exp(-price_diff * 10))
-        return float(np.clip(prob, 0.0, 1.0))
-
 
 # ============================================================================
-# Part 2: Custom Callbacks for Evaluation
+# Part 3: Custom Callbacks (Ray RLlib 2.55 new API)
 # ============================================================================
 
-class MarketMakerCallbacks(DefaultCallbacks):
-    """Custom callbacks for market maker evaluation and logging"""
+class MarketMakerCallbacks(RLlibCallback):
+    """Track episode-level metrics."""
 
-    def on_episode_start(
-        self, *, worker: RolloutWorker, base_env: BaseEnv,
-        policies: Dict[str, Policy], episode: Episode,
-        env_index: int, **kwargs
-    ):
-        """Initialize episode-level metrics"""
-        episode.user_data["inventory_history"] = []
-        episode.user_data["pnl_history"] = []
-        episode.user_data["fill_count"] = 0
+    def on_episode_end(self, *, episode, env_runner, metrics_logger, env, env_index, rl_module, **kwargs):
+        infos = episode.get_infos()
+        if infos:
+            last_info = infos[-1]
+            pnl = last_info.get("realized_pnl_bps", 0.0)
+            metrics_logger.log_value("realized_pnl_bps", pnl)
 
-    def on_episode_step(
-        self, *, worker: RolloutWorker, base_env: BaseEnv,
-        policies: Optional[Dict[str, Policy]] = None,
-        episode: Episode, env_index: int, **kwargs
-    ):
-        """Track metrics at each step"""
-        info = episode.last_info_for()
-        if info:
-            episode.user_data["inventory_history"].append(info.get("inventory", 0))
-            episode.user_data["pnl_history"].append(info.get("total_pnl", 0))
-
-    def on_episode_end(
-        self, *, worker: RolloutWorker, base_env: BaseEnv,
-        policies: Dict[str, Policy], episode: Episode,
-        env_index: int, **kwargs
-    ):
-        """Compute episode-level statistics"""
-        inventory_hist = episode.user_data["inventory_history"]
-        pnl_hist = episode.user_data["pnl_history"]
-
-        if inventory_hist:
-            episode.custom_metrics["avg_inventory"] = np.mean(np.abs(inventory_hist))
-            episode.custom_metrics["max_inventory"] = np.max(np.abs(inventory_hist))
-            episode.custom_metrics["final_pnl"] = pnl_hist[-1] if pnl_hist else 0
-            episode.custom_metrics["max_pnl"] = np.max(pnl_hist) if pnl_hist else 0
-
-            if len(pnl_hist) > 1:
-                returns = np.diff(pnl_hist)
-                sharpe = np.mean(returns) / (np.std(returns) + 1e-8)
-                episode.custom_metrics["sharpe_ratio"] = sharpe
-
-    def on_train_result(self, *, algorithm, result: Dict, **kwargs):
-        """Log training results"""
+    def on_train_result(self, *, algorithm, metrics_logger, result, **kwargs):
+        er = result.get("env_runners", {})
+        reward_mean = er.get("episode_return_mean", 0)
+        n_eps = er.get("num_episodes", 0)
         print(f"\n{'='*60}")
-        print(f"Iteration: {result['training_iteration']}")
-        print(f"Reward Mean: {result.get('episode_reward_mean', 0):.2f}")
-
-        if "evaluation" in result and "custom_metrics" in result["evaluation"]:
-            eval_metrics = result["evaluation"]["custom_metrics"]
-            print(f"Eval Final PnL: {eval_metrics.get('final_pnl_mean', 0):.2f}")
-            print(f"Eval Avg Inventory: {eval_metrics.get('avg_inventory_mean', 0):.2f}")
+        print(f"Iteration: {result.get('training_iteration', '?')}")
+        print(f"Episodes: {n_eps}  Reward Mean: {reward_mean:.3f}")
         print(f"{'='*60}\n")
 
 
 # ============================================================================
-# Part 3: Checkpoint Manager
+# Part 4: Checkpoint Manager
 # ============================================================================
 
 class CheckpointManager:
-    """Manage training checkpoints and restoration"""
+    """Manage training checkpoints and restoration."""
 
-    def __init__(self, checkpoint_dir: str = "./checkpoints"):
+    def __init__(self, checkpoint_dir: str = CHECKPOINT_DIR):
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.checkpoint_dir / "metadata.json"
@@ -294,267 +326,282 @@ class CheckpointManager:
         self.best_reward = -np.inf
 
     def _load_metadata(self) -> Dict[str, Any]:
-        """Load checkpoint metadata"""
         if self.metadata_file.exists():
-            file_size = self.metadata_file.stat().st_size
-            if file_size > 10 * 1024 * 1024:
-                raise ValueError(f"Metadata file too large: {file_size} bytes")
             with open(self.metadata_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         return {"checkpoints": []}
 
     def _save_metadata(self) -> None:
-        """Save checkpoint metadata"""
         with open(self.metadata_file, "w", encoding="utf-8") as f:
             json.dump(self.metadata, f, indent=2)
 
-    def save_checkpoint(
-        self, algorithm: PPO, iteration: int, metrics: Optional[Dict[str, float]] = None
-    ) -> str:
-        """Save algorithm checkpoint with metadata"""
-        checkpoint_path = algorithm.save(self.checkpoint_dir)
-        checkpoint_info = {
+    def save_checkpoint(self, algorithm, iteration: int, metrics: Optional[Dict] = None) -> str:
+        checkpoint_path = algorithm.save(str(self.checkpoint_dir.resolve()))
+        info = {
             "path": str(checkpoint_path),
             "iteration": iteration,
             "timestamp": datetime.now().isoformat(),
             "metrics": metrics or {},
         }
-        self.metadata["checkpoints"].append(checkpoint_info)
-        self.metadata["latest"] = checkpoint_info
+        self.metadata["checkpoints"].append(info)
+        self.metadata["latest"] = info
+        reward = (metrics or {}).get("episode_return_mean", -np.inf)
+        if reward > self.best_reward:
+            self.best_reward = reward
+            self.metadata["best"] = info
         self._save_metadata()
-        print(f"✅ Checkpoint saved: {checkpoint_path}")
-        return checkpoint_path
+        logger.info(f"Checkpoint saved: {checkpoint_path}")
+        return str(checkpoint_path)
 
-    def load_checkpoint(self, algorithm: PPO, checkpoint_path: Optional[str] = None) -> PPO:
-        """Load algorithm from checkpoint"""
-        if checkpoint_path is None:
-            if "latest" not in self.metadata:
-                raise ValueError("No checkpoints found")
-            checkpoint_path = self.metadata["latest"]["path"]
-        algorithm.restore(checkpoint_path)
-        print(f"✅ Checkpoint loaded: {checkpoint_path}")
-        return algorithm
+    def get_latest_path(self) -> Optional[str]:
+        return self.metadata.get("latest", {}).get("path")
 
-    def get_best_checkpoint(self, metric: str = "episode_reward_mean") -> Optional[str]:
-        """Get path to best checkpoint based on metric"""
-        checkpoints = self.metadata.get("checkpoints", [])
-        if not checkpoints:
-            return None
-        best = max(checkpoints, key=lambda x: x.get("metrics", {}).get(metric, -float("inf")))
-        return best["path"]
+    def get_best_path(self) -> Optional[str]:
+        return self.metadata.get("best", {}).get("path")
 
 
 # ============================================================================
-# Part 4: Expert Data Handler
+# Part 5: Expert Data Handler
 # ============================================================================
+
+def _zscore(s: pd.Series) -> pd.Series:
+    s = s.fillna(s.median() if not s.isna().all() else 0.0)
+    sd = s.std()
+    return (s - s.mean()) / sd if sd > 0 else pd.Series(0.0, index=s.index)
+
+
+def build_expert_signal(df: pd.DataFrame) -> pd.Series:
+    """Composite signal (same logic as strategy_btcusdt.py, adapted to available columns)."""
+    return (
+        1.0 * _zscore(df["depth_imbalance_02"].fillna(0.0))
+        + 0.8 * _zscore(df["kline_taker_buy_ratio"].fillna(0.5) - 0.5)
+        + 0.6 * _zscore(df["depth_imbalance_1"].fillna(0.0))
+        + 0.5 * _zscore(np.log1p(df["trade_intensity"].fillna(0.0)))
+        + 0.4 * _zscore(df["volume_imbalance"].fillna(0.0))
+    ).fillna(0.0)
+
 
 class ExpertDataHandler:
-    """Handle expert demonstration data for imitation learning"""
+    """Generate expert trajectories by replaying the composite signal strategy."""
 
-    def __init__(self, output_dir: str = "./expert_data"):
+    def __init__(self, output_dir: str = EXPERT_DATA_DIR):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def create_synthetic_expert_data(
-        self, data_path: str, output_file: str = "synthetic_expert.json"
+    def generate(
+        self,
+        csv_path: str,
+        entry_quantile: float = 0.85,
+        episode_length: int = 1024,
+        max_episodes: int = 200,
     ) -> str:
-        """Create synthetic expert data using a simple strategy"""
-        csv_files = list(Path(data_path).glob("*.csv"))
-        if not csv_files:
-            raise ValueError(f"No CSV files found in {data_path}")
+        raw = pd.read_csv(csv_path)
+        raw["timestamp"] = pd.to_datetime(raw["timestamp"])
+        raw = raw.sort_values("timestamp").reset_index(drop=True)
+        score = build_expert_signal(raw)
+        long_th = score.expanding(min_periods=64).quantile(entry_quantile).bfill()
+        short_th = score.expanding(min_periods=64).quantile(1 - entry_quantile).bfill()
 
-        market_df = pd.read_csv(csv_files[0])
-        episodes = []
+        env_config = {"data_path": csv_path, "episode_length": episode_length}
+        env = MarketMakerEnv(env_config)
 
-        for idx, row in market_df.iterrows():
-            obs = [
-                float(row.get("mid_price", 0)) / 100000.0,
-                float(row.get("spread_bps", 0)) / 100.0,
-                float(row.get("bid_depth_5", 0)) / 1000.0,
-                float(row.get("ask_depth_5", 0)) / 1000.0,
-                float(row.get("imbalance_5", 0)),
-                float(row.get("vwap", 0)) / 100000.0,
-                float(row.get("volume", 0)) / 100.0,
-                float(row.get("buy_sell_ratio", 1.0)),
-                float(row.get("volatility", 0)) * 100.0,
-                0.0,
-                0.0,
-            ]
-            action = [-0.3 + float(row.get("imbalance_5", 0)) * 0.2, 0.3 - float(row.get("imbalance_5", 0)) * 0.2]
-            reward = float(row.get("spread_bps", 0)) * 0.1
+        obs_list, act_list, rew_list = [], [], []
+        rng = np.random.default_rng(42)
+        n_episodes = min(max_episodes, max(1, env.n // episode_length))
 
-            episodes.append({"obs": obs, "actions": action, "rewards": reward})
+        for ep in range(n_episodes):
+            obs, _ = env.reset(seed=int(rng.integers(0, 2**31)))
+            while True:
+                if env.position == 0:
+                    s = float(score.iloc[env.t])
+                    if s >= float(long_th.iloc[env.t]):
+                        a = ACTION_OPEN_LONG
+                    elif s <= float(short_th.iloc[env.t]):
+                        a = ACTION_OPEN_SHORT
+                    else:
+                        a = ACTION_HOLD
+                else:
+                    a = ACTION_HOLD
+                obs_list.append(obs.copy())
+                act_list.append(a)
+                obs, r, term, trunc, _ = env.step(a)
+                rew_list.append(r)
+                if term or trunc:
+                    break
 
-        output_path = self.output_dir / output_file
-        with open(output_path, "w") as f:
-            json.dump(episodes, f)
-
-        print(f"✅ Expert data saved: {output_path}")
-        return str(output_path)
+        obs_arr = np.asarray(obs_list, dtype=np.float32)
+        act_arr = np.asarray(act_list, dtype=np.int64)
+        rew_arr = np.asarray(rew_list, dtype=np.float32)
+        out_path = self.output_dir / "expert.npz"
+        np.savez_compressed(out_path, obs=obs_arr, actions=act_arr, rewards=rew_arr)
+        counts = np.bincount(act_arr, minlength=N_ACTIONS)
+        logger.info(f"Expert data saved: {out_path}  samples={len(act_arr)}  dist={counts.tolist()}")
+        return str(out_path)
 
 
 # ============================================================================
-# Part 5: PPO Training Configuration
+# Part 6: PPO Training Configuration & Functions
 # ============================================================================
 
 def create_ppo_config(
     env_config: Optional[Dict[str, Any]] = None,
-    num_workers: int = 2,
-    num_gpus: int = 0,
+    num_env_runners: int = 0,
+    expert_data_path: Optional[str] = None,
 ) -> PPOConfig:
-    """Create PPO configuration for market maker training"""
+    """Create PPO config for Ray RLlib 2.55 new API stack."""
     if env_config is None:
         env_config = {
-            "max_inventory": 10.0,
-            "inventory_penalty": 0.01,
-            "spread_reward_weight": 1.0,
-            "fill_reward": 0.1,
-            "tick_size": 0.01,
-            "max_steps": 1000,
-            "data_path": "./data/aggregated",
+            "data_path": DATA_CSV,
+            "episode_length": 1024,
+            "max_hold_seconds": 30,
+            "sl_bps": 8.0,
+            "tp_bps": 12.0,
         }
 
     config = (
         PPOConfig()
         .environment(env="MarketMakerEnv", env_config=env_config)
-        .framework("torch")
-        .rollouts(num_rollout_workers=num_workers, num_envs_per_worker=1)
+        .env_runners(num_env_runners=num_env_runners)
         .training(
-            train_batch_size=4000,
-            sgd_minibatch_size=128,
-            num_sgd_iter=30,
             lr=3e-4,
             gamma=0.99,
             lambda_=0.95,
             clip_param=0.2,
             entropy_coeff=0.01,
-            model={"fcnet_hiddens": [256, 256], "fcnet_activation": "relu"},
+            vf_loss_coeff=0.5,
+            train_batch_size_per_learner=2048,
+            num_epochs=6,
+            minibatch_size=256,
+            grad_clip=0.5,
         )
-        .resources(num_gpus=num_gpus, num_cpus_per_worker=1)
-        .evaluation(
-            evaluation_interval=10,
-            evaluation_duration=10,
-            evaluation_num_workers=1,
-            evaluation_config={"explore": False},
+        .learners(num_learners=0)
+        .rl_module(
+            model_config={
+                "fcnet_hiddens": [128, 128],
+                "fcnet_activation": "tanh",
+            }
         )
         .callbacks(MarketMakerCallbacks)
     )
     return config
 
 
-# ============================================================================
-# Part 6: Training Functions
-# ============================================================================
+def train_loop(
+    num_iterations: int,
+    env_config: Optional[Dict] = None,
+    expert_data_path: Optional[str] = None,
+    checkpoint_in: Optional[str] = None,
+    checkpoint_freq: int = 5,
+):
+    """Main training loop with optional expert data and checkpoint restore."""
+    ray.init(ignore_reinit_error=True, log_to_driver=False)
+    register_env("MarketMakerEnv", lambda cfg: MarketMakerEnv(cfg))
 
-def train_from_scratch(num_iterations: int = 100, checkpoint_freq: int = 10):
-    """Train PPO agent from scratch"""
-    print("🚀 Starting PPO training from scratch...")
-    ray.init(ignore_reinit_error=True)
+    config = create_ppo_config(env_config=env_config)
+    algo = config.build_algo()
+    ckpt_mgr = CheckpointManager()
 
-    config = create_ppo_config(num_workers=2, num_gpus=0)
-    algo = config.build()
-    checkpoint_mgr = CheckpointManager()
+    if checkpoint_in:
+        algo.restore(checkpoint_in)
+        logger.info(f"Restored from: {checkpoint_in}")
 
-    for i in range(num_iterations):
+    # BC warmup: if expert data provided, do a few supervised updates on the policy
+    if expert_data_path and Path(expert_data_path).exists() and not checkpoint_in:
+        _bc_warmup(algo, expert_data_path, epochs=3)
+
+    for i in range(1, num_iterations + 1):
         result = algo.train()
-        print(f"\nIteration {i+1}/{num_iterations}")
-        print(f"  Reward: {result.get('episode_reward_mean', 0):.2f}")
+        er = result.get("env_runners", {})
+        reward_mean = er.get("episode_return_mean", 0)
+        n_eps = er.get("num_episodes", 0)
+        logger.info(f"[iter {i}/{num_iterations}] episodes={n_eps} reward_mean={reward_mean:.3f}")
 
-        if (i + 1) % checkpoint_freq == 0:
-            metrics = {"episode_reward_mean": result.get("episode_reward_mean", 0)}
-            checkpoint_mgr.save_checkpoint(algo, i + 1, metrics)
+        if i % checkpoint_freq == 0 or i == num_iterations:
+            metrics = {"episode_return_mean": reward_mean, "iteration": i}
+            ckpt_mgr.save_checkpoint(algo, i, metrics)
 
-    final_checkpoint = checkpoint_mgr.save_checkpoint(algo, num_iterations)
-    print(f"\n✅ Training complete! Final checkpoint: {final_checkpoint}")
+    algo.stop()
     ray.shutdown()
-    return final_checkpoint
+    logger.info("Training complete.")
 
 
-def continue_training(checkpoint_path: str, num_iterations: int = 50):
-    """Continue training from checkpoint"""
-    print(f"🔄 Continuing training from: {checkpoint_path}")
-    ray.init(ignore_reinit_error=True)
+def _bc_warmup(algo, expert_path: str, epochs: int = 3):
+    """Behavioral cloning warmup: inject expert actions into the policy network."""
+    import torch
+    import torch.nn.functional as F
 
-    config = create_ppo_config(num_workers=2, num_gpus=0)
-    algo = config.build()
-    checkpoint_mgr = CheckpointManager()
-    algo = checkpoint_mgr.load_checkpoint(algo, checkpoint_path)
+    data = np.load(expert_path)
+    obs_np = data["obs"].astype(np.float32)
+    act_np = data["actions"].astype(np.int64)
+    n = len(act_np)
+    logger.info(f"BC warmup: {n} expert samples, {epochs} epochs")
 
-    start_iter = checkpoint_mgr.metadata.get("latest", {}).get("iteration", 0)
+    # Access the RLModule from the learner group
+    learner_group = algo.learner_group
+    # Get the module and its parameters
+    module = learner_group._learner.module["default_policy"]
+    optimizer = torch.optim.Adam(module.parameters(), lr=1e-3)
 
-    for i in range(num_iterations):
-        result = algo.train()
-        current_iter = start_iter + i + 1
-        print(f"\nIteration {current_iter}")
-        print(f"  Reward: {result.get('episode_reward_mean', 0):.2f}")
+    obs_t = torch.from_numpy(obs_np)
+    act_t = torch.from_numpy(act_np)
+    batch_size = 256
 
-        if (i + 1) % 10 == 0:
-            metrics = {"episode_reward_mean": result.get("episode_reward_mean", 0)}
-            checkpoint_mgr.save_checkpoint(algo, current_iter, metrics)
+    for ep in range(epochs):
+        perm = torch.randperm(n)
+        total_loss = 0.0
+        n_batches = 0
+        for s in range(0, n, batch_size):
+            idx = perm[s:s + batch_size]
+            batch_obs = obs_t[idx]
+            batch_act = act_t[idx]
+            # Forward pass through the module
+            fwd_out = module.forward_train({"obs": batch_obs})
+            logits = fwd_out["action_dist_inputs"]
+            loss = F.cross_entropy(logits, batch_act)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(module.parameters(), 0.5)
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+        logger.info(f"  BC epoch {ep+1}/{epochs} loss={total_loss/max(n_batches,1):.4f}")
 
-    final_checkpoint = checkpoint_mgr.save_checkpoint(algo, start_iter + num_iterations)
-    print(f"\n✅ Continued training complete! Final checkpoint: {final_checkpoint}")
-    ray.shutdown()
-    return final_checkpoint
-
-
-def train_with_expert_data(expert_data_path: str, num_iterations: int = 100):
-    """Train with expert demonstrations"""
-    print(f"🎓 Training with expert data: {expert_data_path}")
-    ray.init(ignore_reinit_error=True)
-
-    config = create_ppo_config(num_workers=2, num_gpus=0)
-    algo = config.build()
-    checkpoint_mgr = CheckpointManager()
-
-    for i in range(num_iterations):
-        result = algo.train()
-        print(f"\nIteration {i+1}/{num_iterations}")
-        print(f"  Reward: {result.get('episode_reward_mean', 0):.2f}")
-
-        if (i + 1) % 10 == 0:
-            metrics = {"episode_reward_mean": result.get("episode_reward_mean", 0)}
-            checkpoint_mgr.save_checkpoint(algo, i + 1, metrics)
-
-    final_checkpoint = checkpoint_mgr.save_checkpoint(algo, num_iterations)
-    print(f"\n✅ Training with expert data complete! Final checkpoint: {final_checkpoint}")
-    ray.shutdown()
-    return final_checkpoint
+    # Sync weights back to env runners
+    learner_group._learner.module.foreach_module(lambda mid, mod: None)
+    logger.info("BC warmup complete, weights synced.")
 
 
 def evaluate_model(checkpoint_path: str, num_episodes: int = 10):
-    """Evaluate trained model"""
-    print(f"📊 Evaluating model: {checkpoint_path}")
-    ray.init(ignore_reinit_error=True)
+    """Evaluate a trained model."""
+    ray.init(ignore_reinit_error=True, log_to_driver=False)
+    register_env("MarketMakerEnv", lambda cfg: MarketMakerEnv(cfg))
 
-    config = create_ppo_config(num_workers=1, num_gpus=0)
-    algo = config.build()
-    checkpoint_mgr = CheckpointManager()
-    algo = checkpoint_mgr.load_checkpoint(algo, checkpoint_path)
+    config = create_ppo_config()
+    algo = config.build_algo()
+    algo.restore(checkpoint_path)
+    logger.info(f"Evaluating: {checkpoint_path}")
 
-    env = MarketMakerEnv({"data_path": "./data/aggregated"})
-    total_rewards = []
-    total_pnls = []
+    env = MarketMakerEnv({"data_path": DATA_CSV, "episode_length": 2048})
+    rewards, pnls = [], []
 
     for ep in range(num_episodes):
-        obs, info = env.reset()
+        obs, _ = env.reset()
         done = False
-        episode_reward = 0
-
+        ep_reward = 0.0
         while not done:
             action = algo.compute_single_action(obs, explore=False)
-            obs, reward, terminated, truncated, info = env.step(action)
-            episode_reward += reward
-            done = terminated or truncated
+            obs, reward, term, trunc, info = env.step(action)
+            ep_reward += reward
+            done = term or trunc
+        rewards.append(ep_reward)
+        pnls.append(info["realized_pnl_bps"])
+        logger.info(f"  ep {ep+1}: reward={ep_reward:.3f} pnl_bps={pnls[-1]:.2f}")
 
-        total_rewards.append(episode_reward)
-        total_pnls.append(info["total_pnl"])
-        print(f"Episode {ep+1}: Reward={episode_reward:.2f}, PnL={info['total_pnl']:.2f}")
-
-    print(f"\n📊 Evaluation Results:")
-    print(f"  Avg Reward: {np.mean(total_rewards):.2f} ± {np.std(total_rewards):.2f}")
-    print(f"  Avg PnL: {np.mean(total_pnls):.2f} ± {np.std(total_pnls):.2f}")
-
+    logger.info(
+        f"Eval done: avg_reward={np.mean(rewards):.3f}±{np.std(rewards):.3f} "
+        f"avg_pnl_bps={np.mean(pnls):.2f}±{np.std(pnls):.2f}"
+    )
+    algo.stop()
     ray.shutdown()
 
 
@@ -563,61 +610,76 @@ def evaluate_model(checkpoint_path: str, num_episodes: int = 10):
 # ============================================================================
 
 def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="PPO Market Maker Training")
-    parser.add_argument("--mode", type=str, default="train",
-                        choices=["train", "continue", "train_expert", "evaluate"],
-                        help="Training mode")
-    parser.add_argument("--iterations", type=int, default=100,
-                        help="Number of training iterations")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Checkpoint path for continue/evaluate mode")
-    parser.add_argument("--expert_data", type=str, default=None,
-                        help="Expert data path for train_expert mode")
-    parser.add_argument("--checkpoint_freq", type=int, default=10,
-                        help="Checkpoint save frequency")
-    parser.add_argument("--num_episodes", type=int, default=10,
-                        help="Number of episodes for evaluation")
-
+    parser = argparse.ArgumentParser(description="PPO Market Maker (Ray RLlib 2.55)")
+    parser.add_argument("--mode", type=str, default="train_expert",
+                        choices=["gen_expert", "train", "continue", "train_expert", "evaluate"])
+    parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--expert_data", type=str, default=None)
+    parser.add_argument("--data", type=str, default=DATA_CSV)
+    parser.add_argument("--checkpoint_freq", type=int, default=5)
+    parser.add_argument("--num_episodes", type=int, default=10)
+    parser.add_argument("--episode_length", type=int, default=1024)
     args = parser.parse_args()
 
     print("=" * 70)
-    print("PPO-Based Market Maker Online Reinforcement Learning")
+    print("PPO-Based Market Maker Online RL (Ray RLlib 2.55)")
     print("=" * 70)
 
-    gym.register(id="MarketMakerEnv", entry_point=MarketMakerEnv)
+    env_config = {
+        "data_path": args.data,
+        "episode_length": args.episode_length,
+    }
 
-    if args.mode == "train":
-        train_from_scratch(args.iterations, args.checkpoint_freq)
+    if args.mode == "gen_expert":
+        handler = ExpertDataHandler()
+        handler.generate(args.data, episode_length=args.episode_length)
 
-    elif args.mode == "continue":
-        if not args.checkpoint:
-            checkpoint_mgr = CheckpointManager()
-            args.checkpoint = checkpoint_mgr.metadata.get("latest", {}).get("path")
-            if not args.checkpoint:
-                print("❌ No checkpoint found. Use --checkpoint to specify one.")
-                return
-        continue_training(args.checkpoint, args.iterations)
+    elif args.mode == "train":
+        train_loop(
+            args.iterations, env_config=env_config,
+            checkpoint_freq=args.checkpoint_freq,
+        )
 
     elif args.mode == "train_expert":
-        if not args.expert_data:
-            expert_handler = ExpertDataHandler()
-            args.expert_data = expert_handler.create_synthetic_expert_data("./data/aggregated")
-        train_with_expert_data(args.expert_data, args.iterations)
+        expert_path = args.expert_data
+        if not expert_path or not Path(expert_path).exists():
+            handler = ExpertDataHandler()
+            expert_path = handler.generate(args.data, episode_length=args.episode_length)
+        train_loop(
+            args.iterations, env_config=env_config,
+            expert_data_path=expert_path,
+            checkpoint_freq=args.checkpoint_freq,
+        )
+
+    elif args.mode == "continue":
+        ckpt = args.checkpoint
+        if not ckpt:
+            mgr = CheckpointManager()
+            ckpt = mgr.get_latest_path()
+        if not ckpt or not Path(ckpt).exists():
+            print("No checkpoint found. Use --checkpoint to specify one.")
+            return
+        expert_path = args.expert_data
+        if expert_path and not Path(expert_path).exists():
+            expert_path = None
+        train_loop(
+            args.iterations, env_config=env_config,
+            expert_data_path=expert_path,
+            checkpoint_in=ckpt,
+            checkpoint_freq=args.checkpoint_freq,
+        )
 
     elif args.mode == "evaluate":
-        if not args.checkpoint:
-            checkpoint_mgr = CheckpointManager()
-            args.checkpoint = checkpoint_mgr.get_best_checkpoint()
-            if not args.checkpoint:
-                print("❌ No checkpoint found. Use --checkpoint to specify one.")
-                return
-        evaluate_model(args.checkpoint, args.num_episodes)
-
-    else:
-        print(f"❌ Unknown mode: {args.mode}")
+        ckpt = args.checkpoint
+        if not ckpt:
+            mgr = CheckpointManager()
+            ckpt = mgr.get_best_path() or mgr.get_latest_path()
+        if not ckpt or not Path(ckpt).exists():
+            print("No checkpoint found. Use --checkpoint to specify one.")
+            return
+        evaluate_model(ckpt, args.num_episodes)
 
 
 if __name__ == "__main__":
     main()
-
