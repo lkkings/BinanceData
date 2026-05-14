@@ -4,12 +4,19 @@ import zipfile
 import pandas as pd
 from datetime import datetime, timedelta
 
-BASE_URL = "https://data.binance.vision/data/spot/daily/trades"
+# 交易历史下载链接
+BASE_URL = "https://data.binance.vision/data/futures/um/daily/trades"
+# 示例："https://data.binance.vision/data/futures/um/daily/trades/BTCUSDT/BTCUSDT-trades-2024-12-14.zip"
+# 订单簿深度下载链接
+# 示例："https://data.binance.vision/data/futures/um/daily/bookDepth/BTCUSDT/BTCUSDT-bookDepth-2024-12-14.zip"
+# 
+# 注意：这个链接是 Binance 官方提供的历史数据，适合回测和分析，但不适合实时数据采集。
 
 
-def download_day(symbol, date_str, save_dir="data"):
+
+def download_day(symbol, date_str, save_dir="data",data_type="trades"):
     os.makedirs(save_dir, exist_ok=True)
-    filename = f"{symbol}-trades-{date_str}.zip"
+    filename = f"{symbol}-{data_type}-{date_str}.zip"
     url = f"{BASE_URL}/{symbol}/{filename}"
     local_zip = os.path.join(save_dir, filename)
 

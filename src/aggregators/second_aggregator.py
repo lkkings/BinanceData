@@ -38,15 +38,14 @@ class SecondAggregator:
         # 当前订单簿状态（用于计算深度）
         self.current_orderbook = {}  # {symbol: {'bids': {}, 'asks': {}}}
 
+        # 上一秒的收盘价（用于零成交秒 OHLC 填充，按 symbol 分）
+        self.last_close: dict[str, Decimal] = {}
+
         # 事件时间水位线（最大已见事件秒数）
-        # 聚合基于 WebSocket 事件时间而非本地时钟
         self.max_event_second = 0
-        # 已刷新的秒数（避免重复）
         self.last_flushed_second = 0
-        # 水位线延迟：等待该秒不再有新事件到达
         self.watermark_delay_seconds = 1
 
-        # 聚合任务
         self.aggregation_task = None
         self.running = False
 
@@ -137,31 +136,24 @@ class SecondAggregator:
     async def _aggregation_loop(self):
         """聚合循环（基于事件时间水位线）
 
-        使用 WebSocket 事件时间（而非本地时钟）驱动聚合：
-        - 当水位线前进到 T，说明时间 <= T - watermark_delay 的秒已不再可能收到新事件
-        - 刷新所有 last_flushed_second < s <= flushable_second 的秒
+        每秒严格产出一条记录（含零成交秒），保证下游拿到连续时间索引。
         """
         while self.running:
             try:
-                await asyncio.sleep(0.1)  # 高频检查水位线
+                await asyncio.sleep(0.1)
 
                 if self.max_event_second == 0:
                     continue
 
-                # 首次收到事件时初始化刷新游标
                 if self.last_flushed_second == 0:
                     self.last_flushed_second = self.max_event_second - self.watermark_delay_seconds - 1
 
-                # 可安全刷新的最大秒数
                 flushable_second = self.max_event_second - self.watermark_delay_seconds
 
-                # 从上次刷新点到当前可刷点，逐秒聚合
                 for second in range(self.last_flushed_second + 1, flushable_second + 1):
-                    # 该秒有数据才聚合，没数据也要推进水位线
-                    if second in self.orderbook_buffer or second in self.trade_buffer:
-                        await self._aggregate_second(second)
-                        self.orderbook_buffer.pop(second, None)
-                        self.trade_buffer.pop(second, None)
+                    await self._aggregate_second(second)
+                    self.orderbook_buffer.pop(second, None)
+                    self.trade_buffer.pop(second, None)
                     self.last_flushed_second = second
 
             except asyncio.CancelledError:
@@ -170,19 +162,18 @@ class SecondAggregator:
                 logger.error(f"聚合循环错误: {e}", exc_info=True)
 
     async def _aggregate_second(self, timestamp_second: int):
-        """聚合某一秒的数据（合并订单簿和成交）"""
-        # 按交易对收集订单簿更新
+        """聚合某一秒的数据（订单簿 + 成交）。零成交秒也产出记录。"""
         ob_by_symbol = defaultdict(list)
         for item in self.orderbook_buffer.get(timestamp_second, []):
             ob_by_symbol[item['symbol']].append(item['data'])
 
-        # 按交易对收集成交
         tr_by_symbol = defaultdict(list)
         for item in self.trade_buffer.get(timestamp_second, []):
             tr_by_symbol[item['symbol']].append(item['data'])
 
-        # 合并出现的所有交易对
-        all_symbols = set(ob_by_symbol.keys()) | set(tr_by_symbol.keys())
+        # 即使当前秒没有新事件，也对已知 symbol 输出一条（用上次 close 填充）
+        known_symbols = set(self.last_close.keys()) | set(self.current_orderbook.keys())
+        all_symbols = set(ob_by_symbol.keys()) | set(tr_by_symbol.keys()) | known_symbols
 
         for symbol in all_symbols:
             try:
@@ -198,10 +189,43 @@ class SecondAggregator:
                     if tr_list else None
                 )
 
+                # 零成交秒：OHLC 用上一秒 close 填充，量类为 0
+                if tr_feat is None:
+                    last = self.last_close.get(symbol)
+                    if last is None:
+                        # 尚未有过任何成交，跳过本 symbol
+                        continue
+                    tr_feat = self._empty_trade_features(last)
+                else:
+                    self.last_close[symbol] = tr_feat['close']
+
                 unified = UnifiedMarketData(
                     timestamp=datetime.fromtimestamp(timestamp_second, tz=timezone.utc),
                     symbol=symbol,
-                    # 订单簿特征
+                    open=tr_feat['open'],
+                    high=tr_feat['high'],
+                    low=tr_feat['low'],
+                    close=tr_feat['close'],
+                    volume=tr_feat['volume'],
+                    quote_volume=tr_feat['quote_volume'],
+                    vwap=tr_feat['vwap'],
+                    trade_count=tr_feat['trade_count'],
+                    buy_count=tr_feat['buy_count'],
+                    sell_count=tr_feat['sell_count'],
+                    buy_volume=tr_feat['buy_volume'],
+                    sell_volume=tr_feat['sell_volume'],
+                    buy_quote_volume=tr_feat['buy_quote_volume'],
+                    sell_quote_volume=tr_feat['sell_quote_volume'],
+                    trade_intensity=tr_feat['trade_intensity'],
+                    avg_trade_size=tr_feat['avg_trade_size'],
+                    max_trade_size=tr_feat['max_trade_size'],
+                    price_range=tr_feat['price_range'],
+                    tick_count=tr_feat['tick_count'],
+                    up_tick_count=tr_feat['up_tick_count'],
+                    down_tick_count=tr_feat['down_tick_count'],
+                    volume_imbalance=tr_feat['volume_imbalance'],
+                    large_trade_count=tr_feat['large_trade_count'],
+                    large_trade_volume=tr_feat['large_trade_volume'],
                     best_bid_price=ob_feat['best_bid_price'] if ob_feat else None,
                     best_bid_qty=ob_feat['best_bid_qty'] if ob_feat else None,
                     best_ask_price=ob_feat['best_ask_price'] if ob_feat else None,
@@ -210,18 +234,6 @@ class SecondAggregator:
                     mid_price=ob_feat['mid_price'] if ob_feat else None,
                     imbalance_5=ob_feat['imbalance_5'] if ob_feat else None,
                     update_count=ob_feat['update_count'] if ob_feat else 0,
-                    # 成交特征
-                    open=tr_feat['open'] if tr_feat else None,
-                    high=tr_feat['high'] if tr_feat else None,
-                    low=tr_feat['low'] if tr_feat else None,
-                    close=tr_feat['close'] if tr_feat else None,
-                    volume=tr_feat['volume'] if tr_feat else None,
-                    vwap=tr_feat['vwap'] if tr_feat else None,
-                    trade_count=tr_feat['trade_count'] if tr_feat else 0,
-                    buy_count=tr_feat['buy_count'] if tr_feat else 0,
-                    sell_count=tr_feat['sell_count'] if tr_feat else 0,
-                    buy_volume=tr_feat['buy_volume'] if tr_feat else None,
-                    sell_volume=tr_feat['sell_volume'] if tr_feat else None,
                 )
 
                 if self.on_aggregated_data:
@@ -229,6 +241,23 @@ class SecondAggregator:
 
             except Exception as e:
                 logger.error(f"数据聚合错误 {symbol}: {e}", exc_info=True)
+
+    @staticmethod
+    def _empty_trade_features(last_close: Decimal) -> dict:
+        """零成交秒的成交特征：OHLC=last_close，量/计数为 0"""
+        zero = Decimal('0')
+        return {
+            'open': last_close, 'high': last_close, 'low': last_close, 'close': last_close,
+            'volume': zero, 'quote_volume': zero, 'vwap': last_close,
+            'trade_count': 0, 'buy_count': 0, 'sell_count': 0,
+            'buy_volume': zero, 'sell_volume': zero,
+            'buy_quote_volume': zero, 'sell_quote_volume': zero,
+            'trade_intensity': 0.0, 'avg_trade_size': zero, 'max_trade_size': zero,
+            'price_range': zero,
+            'tick_count': 0, 'up_tick_count': 0, 'down_tick_count': 0,
+            'volume_imbalance': 0.0,
+            'large_trade_count': 0, 'large_trade_volume': zero,
+        }
 
     def _compute_orderbook_features(
         self,
@@ -275,7 +304,7 @@ class SecondAggregator:
         }
 
     def _compute_trade_features(self, trades: list[dict]) -> Optional[dict]:
-        """计算成交特征，返回字典或 None（当成交为空）"""
+        """计算成交特征（含高频特征），返回字典或 None（当成交为空）"""
         if not trades:
             return None
 
@@ -290,15 +319,46 @@ class SecondAggregator:
         quote_volume = (df['price'] * df['quantity']).sum()
         trade_count = len(df)
 
-        vwap = quote_volume / volume if volume > 0 else Decimal('0')
-
         buy_trades = df[~df['is_buyer_maker']]
         sell_trades = df[df['is_buyer_maker']]
 
         buy_volume = buy_trades['quantity'].sum() if len(buy_trades) > 0 else Decimal('0')
         sell_volume = sell_trades['quantity'].sum() if len(sell_trades) > 0 else Decimal('0')
+        buy_quote_volume = (buy_trades['price'] * buy_trades['quantity']).sum() if len(buy_trades) > 0 else Decimal('0')
+        sell_quote_volume = (sell_trades['price'] * sell_trades['quantity']).sum() if len(sell_trades) > 0 else Decimal('0')
         buy_count = len(buy_trades)
         sell_count = len(sell_trades)
+
+        # 高频特征
+        trade_intensity = float(trade_count)
+        avg_trade_size = volume / trade_count if trade_count > 0 else Decimal('0')
+        max_trade_size = df['quantity'].max()
+        price_range = high_price - low_price
+
+        prices = df['price'].tolist()
+        price_diffs = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+        tick_count = sum(1 for d in price_diffs if d != 0)
+        up_tick_count = sum(1 for d in price_diffs if d > 0)
+        down_tick_count = sum(1 for d in price_diffs if d < 0)
+
+        total_vol = float(volume) if volume else 0.0
+        vol_imbalance = (float(buy_volume) - float(sell_volume)) / total_vol if total_vol > 0 else 0.0
+
+        # 大单检测
+        quantities = df['quantity'].tolist()
+        if len(quantities) > 1:
+            mean_q = volume / trade_count
+            std_q = (sum((q - mean_q) ** 2 for q in quantities) / len(quantities)) ** Decimal('0.5')
+            threshold = mean_q + 2 * std_q
+            large_trades = [q for q in quantities if q > threshold]
+            large_trade_count = len(large_trades)
+            large_trade_volume = sum(large_trades, Decimal('0'))
+        else:
+            large_trade_count = 0
+            large_trade_volume = Decimal('0')
+
+        # vwap：volume==0 时无定义，返回 None 让下游识别"无成交"语义
+        vwap_val: Optional[Decimal] = (quote_volume / volume) if volume > 0 else None
 
         return {
             'open': open_price,
@@ -306,10 +366,23 @@ class SecondAggregator:
             'low': low_price,
             'close': close_price,
             'volume': volume,
-            'vwap': vwap,
+            'quote_volume': quote_volume,
+            'vwap': vwap_val,
             'trade_count': trade_count,
             'buy_count': buy_count,
             'sell_count': sell_count,
             'buy_volume': buy_volume,
             'sell_volume': sell_volume,
+            'buy_quote_volume': buy_quote_volume,
+            'sell_quote_volume': sell_quote_volume,
+            'trade_intensity': trade_intensity,
+            'avg_trade_size': avg_trade_size,
+            'max_trade_size': max_trade_size,
+            'price_range': price_range,
+            'tick_count': tick_count,
+            'up_tick_count': up_tick_count,
+            'down_tick_count': down_tick_count,
+            'volume_imbalance': vol_imbalance,
+            'large_trade_count': large_trade_count,
+            'large_trade_volume': large_trade_volume,
         }

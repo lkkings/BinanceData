@@ -13,12 +13,16 @@ class Settings(BaseSettings):
 
     # 交易对和数据流配置
     symbols: list[str] = ["btcusdt"]
-    streams: list[str] = ["depth@100ms", "trade", "bookTicker"]
+    streams: list[str] = ["depth@100ms", "trade"]
 
     # 数据存储配置
     data_dir: Path = Path("./data")
     raw_data_dir: Path = Path("./data/raw")
     aggregated_data_dir: Path = Path("./data/aggregated")
+
+    # 历史数据配置
+    history_base_url: str = "https://data.binance.vision/data/futures/um/daily/trades"
+    is_futures: bool = True
 
     # 日志配置
     log_level: str = "INFO"
