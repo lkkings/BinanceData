@@ -1,0 +1,52 @@
+# 排除版本控制
+.git
+.gitignore
+.github
+
+# 排除虚拟环境
+.venv
+venv
+env
+
+# Python 缓存
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# 数据 / 临时文件
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+*.tmp
+
+# 文档 / 测试 / 示例（运行时不需要）
+README.md
+docs/
+tests/
+examples/
+*.md
+
+# 编辑器配置
+.vscode
+.idea
+.DS_Store
+
+# 本地配置
+.env
+.env.local
+.env.*.local
+
+# 项目元数据（容器内不需要）
+.python-version
+uv.lock
+pyproject.toml
+
+# 旧的 plan/memory 目录
+.claude/

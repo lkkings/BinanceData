@@ -1,0 +1,75 @@
+services:
+  redis:
+    image: docker.m.daocloud.io/library/redis:7-alpine
+    container_name: binance-data-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - binance-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: binance-data:latest
+    container_name: binance-data-app
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # === 数据采集 ===
+      SYMBOLS: "${SYMBOLS:-btcusdt,ethusdt}"
+      STREAMS: '${STREAMS:-["depth@100ms","trade"]}'
+      IS_FUTURES: "${IS_FUTURES:-true}"
+
+      # === 存储 ===
+      SQLITE_PATH: "/app/data/market.db"
+      RAW_DATA_DIR: "/app/data/raw"
+      REDIS_URL: "redis://redis:6379/0"
+      REDIS_RETENTION_DAYS: "${REDIS_RETENTION_DAYS:-7}"
+
+      # === 历史回填 ===
+      HISTORY_BACKFILL_DAYS: "${HISTORY_BACKFILL_DAYS:-7}"
+      HISTORY_RETRY_CRON_HOUR: "${HISTORY_RETRY_CRON_HOUR:-2}"
+
+      # === HTTP/WebSocket 服务 ===
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+      API_KEY: "${API_KEY:-}"
+      WS_DEFAULT_HISTORY_MINUTES: "${WS_DEFAULT_HISTORY_MINUTES:-60}"
+      WS_MAX_HISTORY_MINUTES: "${WS_MAX_HISTORY_MINUTES:-10080}"
+      WS_CLIENT_QUEUE_MAXSIZE: "${WS_CLIENT_QUEUE_MAXSIZE:-1000}"
+
+      # === 日志 ===
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_JSON: "${LOG_JSON:-true}"
+
+      TZ: "Asia/Shanghai"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - app-data:/app/data
+    networks:
+      - binance-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+networks:
+  binance-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+  app-data:

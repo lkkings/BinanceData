@@ -1,0 +1,17 @@
+# 服务运行时依赖（仅服务实际用到的，不含 ML 训练栈）
+# pyproject.toml 中 ray/torch/open-spiel/tensorboard 等仅为开发环境保留
+
+websockets>=12.0
+aiohttp>=3.9.0
+requests>=2.31.0
+pandas>=2.2.0
+numpy>=1.26.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+structlog>=24.1.0
+python-dateutil>=2.9.0
+redis>=5.0.0
+aiosqlite>=0.20.0
+apscheduler>=3.10.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
