@@ -107,7 +107,8 @@ class UnifiedMarketData:
     large_trade_count: int = 0
     large_trade_volume: Optional[Decimal] = None
 
-    # 订单簿特征（实时 depth@100ms 流计算）
+
+    # 订单簿 Top-of-Book 特征（实时流）
     best_bid_price: Optional[Decimal] = None
     best_bid_qty: Optional[Decimal] = None
     best_ask_price: Optional[Decimal] = None

@@ -9,18 +9,20 @@ import numpy as np
 import pandas as pd
 import requests
 
-from ..config import get_settings
-from ..models import UnifiedMarketData
+from ...config import get_settings
+from ...domain import UnifiedMarketData
 
 logger = logging.getLogger(__name__)
 
 
 BOOK_DEPTH_BASE_URL = "https://data.binance.vision/data/futures/um/daily/bookDepth"
-KLINES_BASE_URL = "https://data.binance.vision/data/futures/um/daily/klines"
 
 
-class HistoryCollector:
-    """从 Binance 官方历史数据下载逐笔成交、订单簿深度和K线并按秒聚合"""
+class HistoryDownloader:
+    """从 Binance 官方历史数据下载逐笔成交、订单簿深度并聚合到分钟
+
+    kline 字段从 trade 流重建（与实时流保持一致）。
+    """
 
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
@@ -31,9 +33,6 @@ class HistoryCollector:
 
     def _depth_zip_path(self, date_str: str) -> Path:
         return self.settings.raw_data_dir / f"{self.symbol}-bookDepth-{date_str}.zip"
-
-    def _klines_zip_path(self, date_str: str, interval: str = "1m") -> Path:
-        return self.settings.raw_data_dir / f"{self.symbol}-{interval}-{date_str}.zip"
 
     def _download_file(self, url: str, local_path: Path) -> bool:
         if local_path.exists():
@@ -67,14 +66,6 @@ class HistoryCollector:
         """下载某天的订单簿深度数据，返回 zip 路径或 None"""
         zip_path = self._depth_zip_path(date_str)
         url = f"{BOOK_DEPTH_BASE_URL}/{self.symbol}/{self.symbol}-bookDepth-{date_str}.zip"
-        if self._download_file(url, zip_path):
-            return zip_path
-        return None
-
-    def download_klines(self, date_str: str, interval: str = "1m") -> Path | None:
-        """下载某天的K线数据，返回 zip 路径或 None"""
-        zip_path = self._klines_zip_path(date_str, interval)
-        url = f"{KLINES_BASE_URL}/{self.symbol}/{interval}/{self.symbol}-{interval}-{date_str}.zip"
         if self._download_file(url, zip_path):
             return zip_path
         return None
@@ -139,71 +130,6 @@ class HistoryCollector:
         removed = original_len - len(df)
         if removed > 0:
             logger.info(f"bookDepth 已过滤 {removed} 条异常数据 ({removed/original_len*100:.3f}%)")
-
-        return df
-
-    def load_klines(self, zip_path: Path) -> pd.DataFrame:
-        """从 zip 中读取K线数据
-
-        字段: open_time, open, high, low, close, volume, close_time,
-              quote_volume, count, taker_buy_volume, taker_buy_quote_volume, ignore
-        """
-        with zipfile.ZipFile(zip_path, 'r') as z:
-            csv_name = z.namelist()[0]
-            with z.open(csv_name) as f:
-                df = pd.read_csv(f, header=None, skiprows=1)
-
-        df.columns = [
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "count",
-            "taker_buy_volume", "taker_buy_quote_volume", "ignore"
-        ]
-        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
-        df = df.drop(columns=['close_time', 'ignore'])
-        df = df.set_index('open_time').sort_index()
-        return df
-
-    def _compute_kline_features(self, klines_df: pd.DataFrame) -> pd.DataFrame:
-        """从K线数据计算分钟级特征
-
-        提取特征:
-        - kline_open/high/low/close: 分钟K线 OHLC
-        - kline_volume: 分钟成交量
-        - kline_quote_volume: 分钟成交额
-        - kline_count: 分钟成交笔数
-        - kline_taker_buy_ratio: 主动买入占比 (taker_buy_volume / volume)
-        - kline_body_ratio: 实体占比 |close - open| / (high - low)
-        - kline_upper_shadow: 上影线比例
-        - kline_lower_shadow: 下影线比例
-        """
-        df = klines_df.copy()
-
-        df['kline_taker_buy_ratio'] = df['taker_buy_volume'] / df['volume'].replace(0, np.nan)
-        df['kline_taker_buy_ratio'] = df['kline_taker_buy_ratio'].fillna(0.5)
-
-        hl_range = df['high'] - df['low']
-        body = (df['close'] - df['open']).abs()
-        df['kline_body_ratio'] = body / hl_range.replace(0, np.nan)
-        df['kline_body_ratio'] = df['kline_body_ratio'].fillna(0)
-
-        upper_shadow = df['high'] - df[['open', 'close']].max(axis=1)
-        lower_shadow = df[['open', 'close']].min(axis=1) - df['low']
-        df['kline_upper_shadow'] = upper_shadow / hl_range.replace(0, np.nan)
-        df['kline_upper_shadow'] = df['kline_upper_shadow'].fillna(0)
-        df['kline_lower_shadow'] = lower_shadow / hl_range.replace(0, np.nan)
-        df['kline_lower_shadow'] = df['kline_lower_shadow'].fillna(0)
-
-        df = df.rename(columns={
-            'open': 'kline_open',
-            'high': 'kline_high',
-            'low': 'kline_low',
-            'close': 'kline_close',
-            'volume': 'kline_volume',
-            'quote_volume': 'kline_quote_volume',
-            'count': 'kline_count',
-            'taker_buy_volume': 'kline_taker_buy_volume',
-            'taker_buy_quote_volume': 'kline_taker_buy_quote_volume',
-        })
 
         return df
 
@@ -294,9 +220,9 @@ class HistoryCollector:
 
     def _compute_features(
         self, timestamp: pd.Timestamp, trades: pd.DataFrame,
-        depth_row: pd.Series | None = None, kline_row: pd.Series | None = None
+        depth_row: pd.Series | None = None
     ) -> UnifiedMarketData:
-        """计算单秒内的所有特征"""
+        """计算单秒/分钟内的所有特征，kline 字段从 trade 数据直接计算"""
         prices = trades['price'].values
         qtys = trades['qty'].values
         quote_qtys = trades['quote_qty'].values
@@ -309,8 +235,6 @@ class HistoryCollector:
         close_p = Decimal(str(prices[-1]))
         volume = Decimal(str(qtys.sum()))
         quote_volume = Decimal(str(quote_qtys.sum()))
-        # vwap: volume==0 不会出现在此函数中（trades 非空即至少一笔），保留除法；
-        # 整秒零成交的补齐由 save_aggregated_data 完成
         vwap = Decimal(str(quote_qtys.sum() / qtys.sum()))
 
         # 买卖统计
@@ -340,7 +264,7 @@ class HistoryCollector:
         total_vol = float(volume)
         vol_imbalance = (float(buy_vol) - float(sell_vol)) / total_vol if total_vol > 0 else 0.0
 
-        # 大单检测 (> mean + 2*std)
+        # 大单检测
         if len(qtys) > 1:
             threshold = qtys.mean() + 2 * qtys.std()
             large_mask = qtys > threshold
@@ -349,6 +273,19 @@ class HistoryCollector:
         else:
             large_count = 0
             large_volume = Decimal('0')
+
+        # kline 字段从 trade 数据计算（与实时流保持一致）
+        hl_range = high_p - low_p if high_p and low_p else Decimal("0")
+        body = abs(close_p - open_p) if close_p and open_p else Decimal("0")
+
+        kline_taker_buy_ratio = float(buy_vol / volume) if volume and volume > 0 else 0.5
+        kline_body_ratio = float(body / hl_range) if hl_range > 0 else 0.0
+        kline_upper_shadow = (
+            float((high_p - max(open_p, close_p)) / hl_range) if hl_range > 0 else 0.0
+        )
+        kline_lower_shadow = (
+            float((min(open_p, close_p) - low_p) / hl_range) if hl_range > 0 else 0.0
+        )
 
         return UnifiedMarketData(
             timestamp=timestamp.to_pydatetime(),
@@ -389,21 +326,54 @@ class HistoryCollector:
             total_bid_depth=float(depth_row['total_bid_depth']) if depth_row is not None and 'total_bid_depth' in depth_row else None,
             total_ask_depth=float(depth_row['total_ask_depth']) if depth_row is not None and 'total_ask_depth' in depth_row else None,
             depth_imbalance_total=float(depth_row['depth_imbalance_total']) if depth_row is not None and 'depth_imbalance_total' in depth_row else None,
-            # K线特征
-            kline_open=float(kline_row['kline_open']) if kline_row is not None else None,
-            kline_high=float(kline_row['kline_high']) if kline_row is not None else None,
-            kline_low=float(kline_row['kline_low']) if kline_row is not None else None,
-            kline_close=float(kline_row['kline_close']) if kline_row is not None else None,
-            kline_volume=float(kline_row['kline_volume']) if kline_row is not None else None,
-            kline_quote_volume=float(kline_row['kline_quote_volume']) if kline_row is not None else None,
-            kline_count=int(kline_row['kline_count']) if kline_row is not None else None,
-            kline_taker_buy_volume=float(kline_row['kline_taker_buy_volume']) if kline_row is not None else None,
-            kline_taker_buy_quote_volume=float(kline_row['kline_taker_buy_quote_volume']) if kline_row is not None else None,
-            kline_taker_buy_ratio=float(kline_row['kline_taker_buy_ratio']) if kline_row is not None else None,
-            kline_body_ratio=float(kline_row['kline_body_ratio']) if kline_row is not None else None,
-            kline_upper_shadow=float(kline_row['kline_upper_shadow']) if kline_row is not None else None,
-            kline_lower_shadow=float(kline_row['kline_lower_shadow']) if kline_row is not None else None,
+            # kline 字段（从 trade 重建）
+            kline_open=float(open_p) if open_p else None,
+            kline_high=float(high_p) if high_p else None,
+            kline_low=float(low_p) if low_p else None,
+            kline_close=float(close_p) if close_p else None,
+            kline_volume=float(volume) if volume else None,
+            kline_quote_volume=float(quote_volume) if quote_volume else None,
+            kline_count=trade_count,
+            kline_taker_buy_volume=float(buy_vol) if buy_vol else None,
+            kline_taker_buy_quote_volume=float(buy_quote_vol) if buy_quote_vol else None,
+            kline_taker_buy_ratio=kline_taker_buy_ratio,
+            kline_body_ratio=kline_body_ratio,
+            kline_upper_shadow=kline_upper_shadow,
+            kline_lower_shadow=kline_lower_shadow,
         )
+
+    def aggregate_to_minutes(
+        self, trades_df: pd.DataFrame, depth_df: pd.DataFrame
+    ) -> Generator[UnifiedMarketData, None, None]:
+        """将逐笔成交按分钟聚合，合并订单簿深度特征。
+
+        kline 字段从 trade 数据直接计算（与实时流保持一致）。
+        """
+        trades_df = trades_df.copy()
+        trades_df['minute'] = trades_df['time'].dt.floor('1min')
+
+        depth_features = self._compute_depth_features(depth_df)
+
+        minutes = pd.Series(sorted(trades_df['minute'].unique()), name='minute')
+        minutes_idx = pd.DataFrame({'minute': minutes.astype('datetime64[ns, UTC]')})
+
+        depth_lookup = None
+        if not depth_features.empty:
+            depth_frame = depth_features.reset_index().rename(columns={'timestamp': 'minute'}).sort_values('minute')
+            depth_frame['minute'] = depth_frame['minute'].astype('datetime64[ns, UTC]')
+            depth_lookup = pd.merge_asof(
+                minutes_idx, depth_frame, on='minute', direction='backward'
+            ).set_index('minute')
+
+        for ts, group in trades_df.groupby('minute'):
+            ts_key = pd.Timestamp(ts).tz_convert('UTC') if pd.Timestamp(ts).tzinfo else pd.Timestamp(ts, tz='UTC')
+            ts_key = ts_key.as_unit('ns')
+            depth_row = depth_lookup.loc[ts_key] if depth_lookup is not None and ts_key in depth_lookup.index else None
+
+            if depth_row is not None and depth_row.isna().all():
+                depth_row = None
+
+            yield self._compute_features(ts, group, depth_row)
 
     def collect_day(self, date_str: str) -> list[UnifiedMarketData] | None:
         """下载并聚合某天的数据（trades + bookDepth + klines），返回 None 表示数据不可用"""
@@ -428,3 +398,105 @@ class HistoryCollector:
         results = list(self.aggregate_to_seconds(trades_df, depth_df, klines_df))
         logger.info(f"完成: {len(results)} 条秒级数据")
         return results
+
+    def collect_day_minutes(self, date_str: str) -> list[UnifiedMarketData] | None:
+        """下载并按分钟聚合某天的数据。
+
+        - 下载失败（trades zip 拿不到）→ 返回 None。
+        - 成功 → 返回 1440 条分钟数据（无成交分钟用上一分钟的 close ffill 填充）。
+        """
+        logger.info(f"聚合 {self.symbol} {date_str} (1m) ...")
+
+        zip_path = self.download_day(date_str)
+        if zip_path is None:
+            return None
+
+        trades_df = self.load_trades(zip_path)
+        logger.info(f"已加载逐笔成交: {len(trades_df)} 条")
+
+        depth_zip = self.download_depth(date_str)
+        depth_df = self.load_depth(depth_zip) if depth_zip else pd.DataFrame()
+        if not depth_df.empty:
+            logger.info(f"已加载订单簿深度: {len(depth_df)} 条")
+
+        records = list(self.aggregate_to_minutes(trades_df, depth_df))
+        if not records:
+            logger.warning(f"{date_str} 聚合后为空")
+            return []
+
+        records = self._fill_missing_minutes(records, date_str)
+        logger.info(f"完成: {len(records)} 条分钟数据")
+        return records
+
+    @staticmethod
+    def _fill_missing_minutes(
+        records: list[UnifiedMarketData], date_str: str
+    ) -> list[UnifiedMarketData]:
+        """对一天 1440 分钟做严格连续补齐：缺失分钟用上一分钟的 close 填充。"""
+        from dataclasses import replace
+        from datetime import datetime, timezone, timedelta
+        from decimal import Decimal
+
+        if not records:
+            return records
+
+        symbol = records[0].symbol
+        day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        existing = {r.timestamp: r for r in records}
+
+        out: list[UnifiedMarketData] = []
+        last: UnifiedMarketData | None = None
+        zero = Decimal("0")
+
+        for i in range(1440):
+            ts = day_start + timedelta(minutes=i)
+            if ts in existing:
+                last = existing[ts]
+                out.append(last)
+                continue
+            if last is None:
+                # 当天首批分钟缺失，先跳过；等到第一条真实记录后再回填
+                continue
+
+            close = last.close
+            filled = replace(
+                last,
+                timestamp=ts,
+                open=close, high=close, low=close, close=close,
+                volume=zero, quote_volume=zero, vwap=close,
+                trade_count=0, buy_count=0, sell_count=0,
+                buy_volume=zero, sell_volume=zero,
+                buy_quote_volume=zero, sell_quote_volume=zero,
+                trade_intensity=0.0, avg_trade_size=zero, max_trade_size=zero,
+                price_range=zero,
+                tick_count=0, up_tick_count=0, down_tick_count=0,
+                volume_imbalance=0.0,
+                large_trade_count=0, large_trade_volume=zero,
+            )
+            out.append(filled)
+
+        # 若开头存在缺失，使用第一条真实记录的 close 反向填充
+        if out and out[0].timestamp != day_start:
+            first = out[0]
+            close = first.close
+            head: list[UnifiedMarketData] = []
+            ts = day_start
+            while ts < first.timestamp:
+                head.append(replace(
+                    first,
+                    timestamp=ts,
+                    open=close, high=close, low=close, close=close,
+                    volume=zero, quote_volume=zero, vwap=close,
+                    trade_count=0, buy_count=0, sell_count=0,
+                    buy_volume=zero, sell_volume=zero,
+                    buy_quote_volume=zero, sell_quote_volume=zero,
+                    trade_intensity=0.0, avg_trade_size=zero, max_trade_size=zero,
+                    price_range=zero,
+                    tick_count=0, up_tick_count=0, down_tick_count=0,
+                    volume_imbalance=0.0,
+                    large_trade_count=0, large_trade_volume=zero,
+                ))
+                ts += timedelta(minutes=1)
+            out = head + out
+
+        return out
